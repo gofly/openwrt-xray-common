@@ -1,0 +1,64 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+STOP=15
+
+USE_PROCD=1
+
+PROG=/usr/bin/xray
+
+NAME="xray"
+
+start_rules() {
+	cfg="$1"
+	config_get local_port $cfg 'local_port'
+	config_get wan_bp4_list $cfg 'wan_bp4_list'
+	config_get wan_bp6_list $cfg 'wan_bp6_list'
+	config_get wan_fw_ports $cfg 'wan_fw_ports'
+	config_get lan_fw_list $cfg 'lan_fw_list'
+	config_get lan_ifaces $cfg 'lan_ifaces'
+
+   	/usr/bin/xray-rules \
+		-l "$local_port" \
+		-b "$wan_bp4_list" \
+		-B "$wan_bp6_list" \
+		-p "$wan_fw_ports" \
+		-m "$lan_fw_list" \
+		-i "$lan_ifaces" ||
+	/usr/bin/xray-rules -f
+}
+
+start_xray() {
+	cfg="$1"
+	config_get config_path $cfg 'config_path'
+
+	procd_open_instance
+	if [ -d $config_path ]; then
+		procd_set_param command $PROG -confdir $config_path
+	else
+		procd_set_param command $PROG -config $config_path
+	fi
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param limits nofile="100000 100000"
+	procd_append_param limits core="0 0"
+	procd_close_instance
+}
+
+flush_rules() {
+	cfg="$1"
+
+	/usr/bin/xray-rules -f
+}
+
+start_service() {
+	config_load $NAME
+	config_foreach start_xray 'xray'
+	config_foreach start_rules 'rules'
+}
+
+stop_service() {
+	config_load $NAME
+	config_foreach flush_rules 'rules'
+}
+

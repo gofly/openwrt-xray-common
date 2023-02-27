@@ -1,0 +1,180 @@
+#!/bin/sh
+usage() {
+	cat <<-EOF
+		Usage: xray-rules [options]
+		Valid options are:
+			-l <local_port>         port number of xray local server
+			-b <ipv4_list_file>     a file whose content is bypassed ipv4 list
+			-B <ipv6_list_file>     a file whose content is bypassed ipv6 list
+			-p <wan_forward_ports>  port numbers of wan forwarded
+			-m <mac_list_file>      a file whose content is forwarded source mac list
+			-i <interface>          proxy only for the given interface
+			-f                      flush the rules
+			-h                      show this help message and exit
+EOF
+	exit $1
+}
+
+loger() {
+	# 1.alert 2.crit 3.err 4.warn 5.notice 6.info 7.debug
+	logger -st xray-rules[$$] -p$1 $2
+}
+
+flush_rules() {
+	nft delete table inet xray 2>/dev/null
+
+	while ip rule del from all fwmark 0x0e/0x0f lookup 100 2>/dev/null; do echo >/dev/null; done
+	while ip route del local default dev lo scope host table 100 2>/dev/null; do echo >/dev/null; done
+
+	while ip -6 rule del from all fwmark 0x0e/0x0f lookup 100 2>/dev/null; do echo >/dev/null; done
+	while ip -6 route del local default dev lo scope host table 100 2>/dev/null; do echo >/dev/null; done
+}
+
+gen_bypass4_rule(){
+	if [ -n "$WAN_BP4_LIST" ]; then
+		echo ",$(sed ':a; N; $!ba; s/\n/,/g' $WAN_BP4_LIST)"
+	fi
+}
+
+gen_bypass6_rule(){
+	if [ -n "$WAN_BP6_LIST" ]; then
+		echo ",$(sed ':a; N; $!ba; s/\n/,/g' $WAN_BP6_LIST)"
+	fi
+}
+
+gen_src_mac_elements(){
+	if [ -n "$LAN_FW_LIST" ]; then
+		echo "elements = {$(cat $LAN_FW_LIST | grep -v '^#' | sed ':a; N; $!ba; s/\n/,/g')}"
+	fi
+}
+
+gen_src_mac_rule(){
+	if [ -n "$LAN_FW_LIST" ]; then
+		echo "ether saddr != @src_mac return"
+	fi
+}
+
+gen_dport_rule(){
+	if [ -n "$WAN_FW_PORTS" ]; then
+		echo "tcp dport != {$WAN_FW_PORTS} return"
+	fi
+}
+
+gen_iifname_rule(){
+	if [ -n "$IFNAMES" ]; then
+		echo "iifname != {$IFNAMES} return"
+	fi
+}
+
+apply_rules(){
+	#cat <<-EOF
+	nft -f - <<-EOF
+	table inet xray {
+		set dst_ipv4_bypass {
+			type ipv4_addr
+			flags interval
+			auto-merge
+			elements = {
+				127.0.0.0/8,10.0.0.0/8,100.64.0.0/10,172.16.0.0/12,192.0.0.0/24,192.88.99.0/24,192.168.0.0/16,198.51.100.0/24, \
+				169.254.0.0/16,192.0.2.0/24,203.0.113.0/24,224.0.0.0/4,233.252.0.0/24,255.255.255.255/32 \
+				$(gen_bypass4_rule)}
+		}
+
+		set dst_ipv6_bypass {
+			type ipv6_addr
+			flags interval
+			auto-merge
+			elements = {
+				::/128,::1/128,::ffff:0:0/96,64:ff9b::/96,100::/64,fc00::/7,fe80::/10,ff00::/8 \
+				$(gen_bypass6_rule)
+			}
+		}
+		set src_mac {
+			type ether_addr
+			$(gen_src_mac_elements)
+		}
+
+		chain divert {
+			type filter hook prerouting priority -150; policy accept;
+			meta l4proto tcp socket transparent 1 meta mark set 0x0e accept
+		}
+
+		chain xray_mark {
+			meta mark and 0x0f != 0x0e meta l4proto { tcp, udp } meta mark set mark and 0xfffffff0 xor 0x0e return
+		}
+
+		chain mangle_output {
+			type route hook output priority filter + 1;
+			fib daddr type { unspec, local, anycast, multicast } return
+			meta mark and 0x70 == 0x70 return
+			udp dport 53 oifname != "lo" jump xray_mark
+			ip daddr @dst_ipv4_bypass return
+			ip6 daddr @dst_ipv6_bypass return
+			meta l4proto { tcp, udp } jump xray_mark
+		}
+
+		chain xray_tproxy {
+			meta mark and 0x7f != 0x7e meta l4proto {tcp, udp} meta mark set mark and 0xffffff80 xor 0x7e
+			meta l4proto { tcp, udp } tproxy to :$LOCAL_PORT
+		}
+
+		chain mangle_prerouting {
+			type filter hook prerouting priority filter + 1;
+			meta mark and 0x70 == 0x70 return
+			meta mark and 0x0f == 0x0e jump xray_tproxy
+			$(gen_iifname_rule)
+			$(gen_src_mac_rule)
+			$(gen_dport_rule)
+			ip daddr @dst_ipv4_bypass return
+			ip6 daddr @dst_ipv6_bypass return
+			fib daddr type { unspec, local, anycast, multicast } return
+			jump xray_tproxy
+		}
+	}
+EOF
+}
+
+init_route(){
+	ip rule add fwmark 0x0e/0x0f lookup 100
+	ip route add local default dev lo table 100
+	ip -6 rule add fwmark 0x0e/0x0f lookup 100
+	ip -6 route add local default dev lo table 100
+}
+
+
+while getopts ":l:b:B:w:W:p:m:i:fh" arg; do
+	case "$arg" in
+		l)
+			LOCAL_PORT=$OPTARG
+			;;
+		b)
+			WAN_BP4_LIST=$OPTARG
+			;;
+		B)
+			WAN_BP6_LIST=$OPTARG
+			;;
+		p)
+			WAN_FW_PORTS=$OPTARG
+			;;
+		m)
+			LAN_FW_LIST=$OPTARG
+			;;
+		i)
+			IFNAMES=$OPTARG
+			;;
+		f)
+			flush_rules
+			exit 0
+			;;
+		h)
+			usage 0
+			;;
+	esac
+done
+
+[ -z "$LOCAL_PORT" ] && usage 2
+(flush_rules && apply_rules && init_route) || flush_rules
+RET=$?
+[ "$RET" = 0 ] || loger 3 "Start failed!"
+exit $RET
+

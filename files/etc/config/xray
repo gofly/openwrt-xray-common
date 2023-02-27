@@ -1,0 +1,10 @@
+config xray
+	option config_path '/etc/xray/config.json'
+
+config rules
+	option local_port '65535'
+	# option wan_bp4_list '/etc/xray/wan_bp4_list.txt'
+	# option wan_bp6_list '/etc/xray/wan_bp6_list.txt'
+	# option wan_fw_ports '22,80,443'
+	# option lan_fw_list '/etc/xray/lan_fw_list.txt'
+	# option lan_ifaces 'br-lan'
